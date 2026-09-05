@@ -1,0 +1,135 @@
+services:
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: assessiq_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-assessiq}
+      POSTGRES_USER: ${POSTGRES_USER:-assessiq_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-assessiq_dev_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-assessiq_user} -d ${POSTGRES_DB:-assessiq}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: assessiq_redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── FastAPI Backend ────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.api
+    container_name: assessiq_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+    volumes:
+      - ./apps/api:/app
+      - api_uploads:/app/uploads
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ── Celery Worker ─────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.api
+    container_name: assessiq_worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+    volumes:
+      - ./apps/api:/app
+      - api_uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A worker.celery_app worker --loglevel=info --concurrency=4
+
+  # ── Celery Beat (scheduler) ────────────────────────────────────────────────
+  beat:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.api
+    container_name: assessiq_beat
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+    volumes:
+      - ./apps/api:/app
+    depends_on:
+      - worker
+    command: celery -A worker.celery_app beat --loglevel=info
+
+  # ── React Frontend ─────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.frontend
+    container_name: assessiq_frontend
+    restart: unless-stopped
+    volumes:
+      - ./apps/web:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: http://localhost:8000
+    depends_on:
+      - api
+
+  # ── Nginx Reverse Proxy ────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: assessiq_nginx
+    restart: unless-stopped
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+      - frontend
+
+volumes:
+  postgres_data:
+  redis_data:
+  api_uploads:
